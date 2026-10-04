@@ -7,16 +7,27 @@ Four Macs on the same LAN work together. A private DNS server resolves custom
 load-balances requests across two Node.js/Express backends. If one backend
 fails, Nginx fails over to the other.
 
+## Team Members
+
+| Enrollment No. | Name |
+|----------------|------|
+| 2401010182 | Harshit Kudhial |
+| 2401010306 | Om Chimurkar |
+| 2401010317 | Pankaj Upadhyay |
+| 2401020045 | Prakhar Rawat |
+
 ---
 
 ## Architecture
 
 ```
             ┌──────────────────────┐
-            │  Mac 1 – DNS Client  │
-            │  dnsmasq (127.0.0.1) │
+            │  Mac 1 – DNS Server  │
+            │  dnsmasq (UDP :53)   │
             └──────────┬───────────┘
                        │  app.teamX.test → NGINX_IP
+                       ▼
+            Client (any Mac using Mac 1 as DNS)
                        │  HTTPS request
                        ▼
             ┌──────────────────────┐
@@ -33,13 +44,13 @@ fails, Nginx fails over to the other.
    └────────────────────┘  └────────────────────┘
 ```
 
-**Request flow:** Mac 1 → dnsmasq → Mac 2 Nginx → Backend A / Backend B
+**Request flow:** Client → DNS lookup on Mac 1 (dnsmasq) → HTTPS to Mac 2 Nginx → Backend A / Backend B
 
 ## Components
 
 | Machine | Role | Software | Port(s) |
 |---------|------|----------|---------|
-| Mac 1 | DNS client (runs the private DNS resolver) | dnsmasq, dig, curl | 53 |
+| Mac 1 | Private DNS server for the team's `.test` domains | dnsmasq | 53 |
 | Mac 2 | Reverse proxy / load balancer / TLS termination | Nginx | 80, 443 |
 | Mac 3 | Backend A | Node.js + Express | 3001 |
 | Mac 4 | Backend B | Node.js + Express | 3002 |
@@ -83,6 +94,7 @@ with your own values before running anything:
 
 | Placeholder | Replace with | Find it with |
 |-------------|--------------|--------------|
+| `MAC1_IP` | LAN IP of Mac 1 | `ipconfig getifaddr en0` on Mac 1 |
 | `NGINX_IP` | LAN IP of Mac 2 | `ipconfig getifaddr en0` on Mac 2 |
 | `BACKEND_A_IP` | LAN IP of Mac 3 | `ipconfig getifaddr en0` on Mac 3 |
 | `BACKEND_B_IP` | LAN IP of Mac 4 | `ipconfig getifaddr en0` on Mac 4 |
@@ -180,6 +192,19 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
   -addext "subjectAltName=DNS:app.teamX.test,DNS:api.teamX.test"
 ```
 
+### Trust the certificate on every client Mac
+
+`curl` must validate the certificate, so **never use `-k`**. Copy
+`teamX.crt` (the certificate only, never the `.key`) to each client Mac and
+add it to the System keychain as trusted:
+
+```bash
+sudo security add-trusted-cert -d -r trustRoot \
+  -k /Library/Keychains/System.keychain teamX.crt
+```
+
+Now `curl https://app.teamX.test` succeeds without `-k`.
+
 ## 5. Configure Nginx (Mac 2)
 
 Copy `nginx/nginx.conf` to Homebrew's Nginx config path and replace the
@@ -241,44 +266,64 @@ sudo nginx -s reload  # after config changes
 
 ```
 port=53
-listen-address=127.0.0.1
+interface=en0
+listen-address=127.0.0.1,MAC1_IP
 bind-interfaces
 
 address=/app.teamX.test/NGINX_IP
 address=/api.teamX.test/NGINX_IP
 ```
 
-Install it and tell macOS to use dnsmasq for the `.test` domain:
+`MAC1_IP` is Mac 1's LAN IP. dnsmasq must listen on the LAN interface;
+with only `127.0.0.1` the other Macs could not reach it.
+
+Install it on Mac 1:
 
 ```bash
 cp dns/dnsmasq-project2.conf "$(brew --prefix)/etc/dnsmasq.d/"
 echo "conf-dir=$(brew --prefix)/etc/dnsmasq.d/,*.conf" >> "$(brew --prefix)/etc/dnsmasq.conf"
 
 sudo brew services restart dnsmasq
-
-sudo mkdir -p /etc/resolver
-echo "nameserver 127.0.0.1" | sudo tee /etc/resolver/test
 ```
+
+### Point the client Macs at Mac 1
+
+On each client Mac (Mac 2, 3, 4), set the DNS server to `MAC1_IP`:
+**System Settings → Network → Wi-Fi → Details → DNS → +** → `MAC1_IP`.
+
+Or from the terminal:
+
+```bash
+sudo networksetup -setdnsservers Wi-Fi MAC1_IP
+```
+
+To undo it later: `sudo networksetup -setdnsservers Wi-Fi empty`
 
 ---
 
 ## Testing
 
-All tests are run from **Mac 1** unless noted. `-k` tells curl to accept the
-self-signed certificate.
+All tests are run from a **client Mac** (Mac 2, 3 or 4) that uses Mac 1 as
+its DNS server and trusts the certificate. **No test uses `-k`**, and every
+request uses the domain name, never an IP.
 
 ### Test 1: DNS resolution
 
 ```bash
-dig @127.0.0.1 app.teamX.test +short
-dig @127.0.0.1 api.teamX.test +short
+dig app.teamX.test
+dig api.teamX.test
 ```
 
-Expected: both return `NGINX_IP`.
+Expected: the ANSWER SECTION returns `NGINX_IP`, and the `SERVER:` line shows
+`MAC1_IP#53`.
 
-> `dig` bypasses `/etc/resolver`, so query `@127.0.0.1` directly. `curl` and
-> browsers use the system resolver and pick up `/etc/resolver/test`
-> automatically.
+Prove the name is private (not a real public domain):
+
+```bash
+dig @8.8.8.8 app.teamX.test
+```
+
+Expected: `status: NXDOMAIN`.
 
 ![DNS resolution](screenshots/dns-resolution.png)
 
@@ -296,10 +341,11 @@ Location: https://app.teamX.test/
 ```
 
 ```bash
-curl -kI https://app.teamX.test
+curl -v https://app.teamX.test
 ```
 
-Expected: `HTTP/1.1 200 OK`
+Expected: TLS handshake lines, the certificate subject/SAN matching
+`app.teamX.test`, and `HTTP/1.1 200 OK`.
 
 ![HTTPS working](screenshots/https-working.png)
 
@@ -307,7 +353,7 @@ Expected: `HTTP/1.1 200 OK`
 
 ```bash
 for i in 1 2 3 4 5 6; do
-  curl -skI https://app.teamX.test | grep -i x-backend
+  curl -sI https://app.teamX.test | grep -i x-backend
 done
 ```
 
@@ -326,8 +372,8 @@ X-Backend: B
 ### Test 4: `/api/status`
 
 ```bash
-curl -sk https://api.teamX.test/api/status; echo
-curl -sk https://api.teamX.test/api/status; echo
+curl -s https://api.teamX.test/api/status; echo
+curl -s https://api.teamX.test/api/status; echo
 ```
 
 Expected:
@@ -342,11 +388,11 @@ Expected:
 ### Test 5: Failover (Backend A down → Backend B serves)
 
 1. On **Mac 3**, stop Backend A with `Ctrl+C`.
-2. On **Mac 1**, send requests through Nginx:
+2. On a **client Mac**, send requests through Nginx:
 
    ```bash
    for i in 1 2 3 4; do
-     curl -skI https://app.teamX.test | grep -i x-backend
+     curl -sI https://app.teamX.test | grep -i x-backend
    done
    ```
 
@@ -381,10 +427,10 @@ X-Backend: B
 | Problem | Check |
 |---------|-------|
 | `dig` returns nothing | `sudo brew services list` shows dnsmasq `started`; config has the right `NGINX_IP` |
-| `curl` can't resolve the domain | `/etc/resolver/test` exists; `scutil --dns` lists `127.0.0.1` for domain `test` |
+| `curl` can't resolve the domain | Client DNS is set to `MAC1_IP` (`scutil --dns`); dnsmasq listens on `en0`, not only `127.0.0.1` |
 | `502 Bad Gateway` | Backends running? `curl http://BACKEND_A_IP:3001` from Mac 2 works? macOS firewall allows `node`? |
 | `nginx: bind() to 0.0.0.0:80 failed` | Start Nginx with `sudo` |
-| SSL error in curl | Use `-k` (self-signed cert) |
+| `SSL certificate problem` in curl | The `.crt` is not trusted on that Mac; run the `security add-trusted-cert` step. Do not use `-k` |
 
 ## Security Notes
 
